@@ -8,9 +8,11 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from datetime import datetime, timezone
+
 from hevy2garmin import db
 from hevy2garmin.config import load_config
-from hevy2garmin.fit import generate_fit
+from hevy2garmin.fit import generate_fit, _parse_timestamp
 from hevy2garmin.garmin import (
     delete_activity,
     find_activity_by_start_time,
@@ -82,6 +84,7 @@ def sync(
     since: str | None = None,
     fetch_all: bool = False,
     dry_run: bool = False,
+    respect_grace: bool = True,
     **overrides: Any,
 ) -> dict:
     """Sync Hevy workouts to Garmin Connect.
@@ -103,6 +106,7 @@ def sync(
     garmin_password = overrides.get("garmin_password") or cfg.get("garmin_password", "")
     garmin_token_dir = cfg.get("garmin_token_dir", "~/.garminconnect")
     skip_existing = cfg.get("sync", {}).get("skip_existing", True)
+    grace_minutes = cfg.get("sync", {}).get("grace_period_minutes", 120)
 
     if not limit and not fetch_all and not since:
         limit = cfg.get("sync", {}).get("default_limit", 10)
@@ -126,7 +130,7 @@ def sync(
     merge_activity_types = set(cfg.get("merge_activity_types", ["strength_training"]))
     merge_watch_strategy = cfg.get("merge_watch_strategy", "replace")
     description_enabled = cfg.get("description_enabled", True)
-    stats = {"synced": 0, "skipped": 0, "failed": 0, "total": len(workouts), "unmapped": [], "merged": 0, "merge_fallback": 0}
+    stats = {"synced": 0, "skipped": 0, "failed": 0, "total": len(workouts), "unmapped": [], "merged": 0, "merge_fallback": 0, "deferred": 0}
 
     if merge_mode:
         reset_circuit_breaker()
@@ -141,6 +145,19 @@ def sync(
             logger.debug("Skipping %s (%s) — already synced", wid, title)
             stats["skipped"] += 1
             continue
+
+        # Grace period: on automatic runs, wait until the workout has had time
+        # for its Garmin watch activity to land, so we merge instead of
+        # uploading a duplicate. Manual syncs pass respect_grace=False.
+        if respect_grace and grace_minutes > 0:
+            end_raw = workout.get("end_time") or workout.get("endTime", "")
+            end_dt = _parse_timestamp(end_raw)
+            if end_dt is not None and end_dt.tzinfo is not None:
+                age_min = (datetime.now(timezone.utc) - end_dt).total_seconds() / 60.0
+                if age_min < grace_minutes:
+                    logger.info("  Deferring %s — ended %.0f min ago (< %d min grace); waiting for watch data", wid, age_min, grace_minutes)
+                    stats["deferred"] += 1
+                    continue
 
         logger.info("Syncing: %s (%s)", title, wid)
 
