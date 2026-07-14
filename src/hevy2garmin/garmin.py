@@ -71,13 +71,20 @@ def _sanitize_activity_id(raw: object) -> int | None:
         return None
 
 
-def upload_fit(client: Garmin, fit_path: str | Path, workout_start: str | None = None) -> dict:
+def upload_fit(
+    client: Garmin,
+    fit_path: str | Path,
+    workout_start: str | None = None,
+    exclude_activity_ids: list[int | str] | set[int | str] | None = None,
+) -> dict:
     """Upload a FIT file to Garmin Connect.
 
     Args:
         client: Authenticated Garmin client.
         fit_path: Path to the .fit file.
         workout_start: ISO-8601 start time for matching the uploaded activity.
+        exclude_activity_ids: Activities that existed before the upload. These
+            must not be mistaken for the newly imported activity.
 
     Returns dict with upload_id and activity_id (if found).
     """
@@ -127,7 +134,11 @@ def upload_fit(client: Garmin, fit_path: str | Path, workout_start: str | None =
     if not activity_id and workout_start:
         for attempt, wait in enumerate([3, 5, 10], 1):
             time.sleep(wait)
-            activity_id = find_activity_by_start_time(client, workout_start)
+            activity_id = find_activity_by_start_time(
+                client,
+                workout_start,
+                exclude_activity_ids=exclude_activity_ids,
+            )
             if activity_id:
                 break
             logger.info("  Activity not found yet (attempt %d/%d), retrying...", attempt, 3)
@@ -182,6 +193,7 @@ def find_activity_by_start_time(
     client: Garmin,
     target_start: str,
     window_minutes: int = 10,
+    exclude_activity_ids: list[int | str] | set[int | str] | None = None,
 ) -> int | None:
     """Find a Garmin activity matching a start time within a window.
 
@@ -205,14 +217,18 @@ def find_activity_by_start_time(
     except Exception:
         return None
 
+    excluded = {str(activity_id) for activity_id in (exclude_activity_ids or [])}
     for act in activities:
+        activity_id = act.get("activityId")
+        if str(activity_id) in excluded:
+            continue
         # Only match strength training activities — skip runs, bikes, yoga, etc.
         act_type = act.get("activityType", {}).get("typeKey", "")
         if act_type and act_type not in ("strength_training", "other"):
             continue
 
         if activity_matches_start_time(act, target_start, window_minutes):
-            return act.get("activityId")
+            return activity_id
     return None
 
 

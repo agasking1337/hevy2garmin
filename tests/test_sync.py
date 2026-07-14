@@ -349,6 +349,37 @@ class TestSyncOneWorkout:
                 sync_method="merge",
             )
 
+    def test_watch_replacement_requires_backup_even_with_hr_fusion_off(
+        self, sample_workout: dict
+    ) -> None:
+        from hevy2garmin.hr import HRBackupError
+
+        with patch("hevy2garmin.sync.attempt_merge") as mock_merge, patch(
+            "hevy2garmin.hr.require_activity_hr_backup",
+            side_effect=HRBackupError("source activity preserved"),
+        ) as require_backup, patch("hevy2garmin.sync.generate_fit") as generate_fit:
+            mock_merge.return_value = MergeResult(
+                merged=False,
+                force_fresh_upload=True,
+                delete_after_upload=444,
+                fallback_reason="watch replacement",
+            )
+
+            with pytest.raises(HRBackupError, match="source activity preserved"):
+                sync_one_workout(
+                    sample_workout,
+                    cfg={
+                        "merge_mode": True,
+                        "merge_watch_strategy": "replace",
+                        "hr_fusion": {"enabled": False},
+                    },
+                    garmin_client=MagicMock(),
+                    database=MagicMock(),
+                )
+
+        require_backup.assert_called_once()
+        generate_fit.assert_not_called()
+
     def test_description_disabled_skips_set_description(self, sample_workout: dict) -> None:
         with patch("hevy2garmin.sync.db") as mock_db, \
              patch("hevy2garmin.sync.attempt_merge", return_value=MergeResult(merged=False, fallback_reason="No match")), \
@@ -445,7 +476,11 @@ def test_hr_empty_retries_once_then_counts_no_hr(mock_hr, *rest):
     h.get_workouts.return_value = {"workouts": [w], "page_count": 1}
     mock_hevy_cls.return_value = h; mock_gclient.return_value = MagicMock()
     mock_db.is_synced.return_value = False
-    mock_merge.return_value = MergeResult(merged=False, force_fresh_upload=True, fallback_reason="no match")
+    mock_merge.return_value = MergeResult(
+        merged=False,
+        force_fresh_upload=True,
+        fallback_reason="fresh upload",
+    )
     stats = sync(config={"hevy_api_key": "t", "merge_mode": True,
                          "sync": {"grace_period_minutes": 120},
                          "hr_fusion": {"enabled": True}}, limit=1)

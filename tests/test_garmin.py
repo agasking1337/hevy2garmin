@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -10,6 +11,7 @@ from hevy2garmin.garmin import (
     _sanitize_activity_id,
     find_activity_by_start_time,
     generate_description,
+    upload_fit,
 )
 
 
@@ -95,6 +97,45 @@ class TestFindActivityByStartTime:
             mock_limiter.call.side_effect = Exception("API error")
             result = find_activity_by_start_time(client, "2026-04-01T20:00:00+00:00")
             assert result is None
+
+    def test_excludes_pre_upload_activity(self) -> None:
+        client = MagicMock()
+        acts = self._make_activities(
+            "2026-04-01 20:00:00",
+            "2026-04-01 20:00:02",
+        )
+        with patch("hevy2garmin.garmin._limiter") as mock_limiter:
+            mock_limiter.call.return_value = acts
+            result = find_activity_by_start_time(
+                client,
+                "2026-04-01T20:00:00+00:00",
+                exclude_activity_ids=["1"],
+            )
+            assert result == 2
+
+
+class TestUploadFit:
+    def test_post_upload_lookup_excludes_snapshot_ids(self, tmp_path: Path) -> None:
+        fit_path = tmp_path / "workout.fit"
+        fit_path.write_bytes(b"fit")
+        client = MagicMock()
+        client.upload_activity.return_value = {"detailedImportResult": {"uploadId": "u1"}}
+
+        with patch("hevy2garmin.garmin._limiter") as limiter, patch(
+            "hevy2garmin.garmin.time.sleep"
+        ), patch(
+            "hevy2garmin.garmin.find_activity_by_start_time", return_value=2
+        ) as finder:
+            limiter.call.side_effect = lambda func, *args: func(*args)
+            result = upload_fit(
+                client,
+                fit_path,
+                workout_start="2026-04-01T20:00:00+00:00",
+                exclude_activity_ids=["1"],
+            )
+
+        assert result == {"upload_id": "u1", "activity_id": 2}
+        assert finder.call_args.kwargs["exclude_activity_ids"] == ["1"]
 
 
 class TestGenerateDescription:

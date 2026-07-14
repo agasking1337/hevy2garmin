@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import io
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+import zipfile
 
 import pytest
 
@@ -11,10 +13,16 @@ from fit_tool.fit_file import FitFile
 from fit_tool.profile.messages.record_message import RecordMessage
 
 from hevy2garmin.hr import (
+    HRBackupError,
+    backup_activity_hr,
     build_workout_hr,
     extract_hevy_hr,
+    fetch_activity_hr,
     fetch_watch_hr,
+    hr_for_sync,
+    load_hr_backup,
     merge_hr_sources,
+    save_hr_backup,
 )
 from hevy2garmin.fit import generate_fit
 
@@ -98,6 +106,212 @@ class TestFetchWatchHR:
     def test_missing_timestamps_returns_empty(self):
         client = MagicMock()
         assert fetch_watch_hr(client, {"start_time": "", "end_time": ""}) == []
+
+
+# --- fetch_activity_hr ------------------------------------------------------
+
+class TestFetchActivityHR:
+    WORKOUT = {
+        "title": "Push",
+        "start_time": "2026-03-15T18:00:00+00:00",
+        "end_time": "2026-03-15T18:10:00+00:00",
+        "exercises": [
+            {"title": "Bench Press (Barbell)", "sets": [{"type": "normal", "weight_kg": 60, "reps": 10}]},
+        ],
+    }
+
+    def _zipped_activity(self, tmp_path: Path) -> bytes:
+        fit_path = tmp_path / "activity.fit"
+        generate_fit(
+            self.WORKOUT,
+            hr_samples=[
+                {"time": 0, "hr": 110},
+                {"time": 120, "hr": 130},
+                {"time": 480, "hr": 150},
+            ],
+            output_path=str(fit_path),
+        )
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("123_ACTIVITY.fit", fit_path.read_bytes())
+        return output.getvalue()
+
+    def test_extracts_timestamped_hr_from_original_zip(self, tmp_path: Path):
+        client = MagicMock()
+        client.download_activity.return_value = self._zipped_activity(tmp_path)
+
+        samples = fetch_activity_hr(client, 123, self.WORKOUT)
+
+        assert samples == [
+            {"time": 0.0, "hr": 110},
+            {"time": 120.0, "hr": 130},
+            {"time": 480.0, "hr": 150},
+        ]
+
+    def test_falls_back_to_daily_hr_when_original_download_fails(self):
+        client = MagicMock()
+        client.download_activity.side_effect = RuntimeError("not downloadable")
+        import datetime as dt
+        start_ms = int(dt.datetime.fromisoformat(self.WORKOUT["start_time"]).timestamp() * 1000)
+        client.get_heart_rates.return_value = {
+            "heartRateValues": [[start_ms + 60_000, 120]]
+        }
+
+        samples = build_workout_hr(client, self.WORKOUT, source_activity_id=123)
+
+        assert samples == [{"time": 60.0, "hr": 120}]
+
+
+# --- durable HR backup ------------------------------------------------------
+
+class TestHRBackup:
+    WORKOUT = {
+        "id": "w1",
+        "start_time": "2026-03-15T18:00:00+00:00",
+        "end_time": "2026-03-15T18:10:00+00:00",
+    }
+
+    def test_saves_activity_samples_with_source_metadata(self):
+        database = MagicMock()
+        database.get_app_config.return_value = None
+        samples = [{"time": 0.0, "hr": 100}, {"time": 1.0, "hr": 101}]
+
+        payload = save_hr_backup(database, self.WORKOUT, samples, 123)
+
+        assert payload["sample_count"] == 2
+        assert payload["source_activity_id"] == "123"
+        database.set_app_config.assert_called_once()
+        assert database.set_app_config.call_args.args[0] == "hr_backup_w1"
+
+    def test_denser_backup_is_not_overwritten(self):
+        database = MagicMock()
+        existing = {"sample_count": 100, "hr_samples": [{"time": 0, "hr": 90}]}
+        database.get_app_config.return_value = existing
+
+        result = save_hr_backup(
+            database,
+            self.WORKOUT,
+            [{"time": 0, "hr": 100}],
+            456,
+        )
+
+        assert result is existing
+        database.set_app_config.assert_not_called()
+
+    def test_load_rebases_samples_after_hevy_start_edit(self):
+        database = MagicMock()
+        database.get_app_config.return_value = {
+            "workout_start": "2026-03-15T18:00:00+00:00",
+            "sample_count": 2,
+            "hr_samples": [
+                {"time": 30, "hr": 100},
+                {"time": 120, "hr": 110},
+            ],
+        }
+        edited = {
+            **self.WORKOUT,
+            "start_time": "2026-03-15T18:01:00+00:00",
+        }
+
+        samples = load_hr_backup(database, edited)
+
+        # The 18:00:30 sample is before the edited start and is clipped. The
+        # 18:02:00 sample moves from offset 120s to offset 60s.
+        assert samples == [{"time": 60.0, "hr": 110}]
+
+    @patch("hevy2garmin.hr.fetch_activity_hr")
+    def test_hr_for_sync_persists_activity_hr(self, fetch_activity):
+        fetch_activity.return_value = [{"time": 0, "hr": 100}]
+        database = MagicMock()
+        database.get_app_config.return_value = None
+
+        result = hr_for_sync(
+            database,
+            MagicMock(),
+            self.WORKOUT,
+            {"hr_fusion": {"enabled": True}},
+            source_activity_id=123,
+        )
+
+        assert result == [{"time": 0, "hr": 100}]
+        database.set_app_config.assert_called_once()
+
+    @patch("hevy2garmin.hr.fetch_activity_hr", return_value=[])
+    def test_hr_for_sync_restores_backup_when_source_is_gone(self, _fetch):
+        database = MagicMock()
+        database.get_app_config.return_value = {
+            "workout_start": self.WORKOUT["start_time"],
+            "sample_count": 1,
+            "hr_samples": [{"time": 5, "hr": 105}],
+        }
+
+        result = hr_for_sync(
+            database,
+            MagicMock(),
+            self.WORKOUT,
+            {"hr_fusion": {"enabled": True}},
+            source_activity_id=123,
+        )
+
+        assert result == [{"time": 5.0, "hr": 105}]
+
+    @patch("hevy2garmin.hr.fetch_activity_hr", return_value=[])
+    def test_replacement_stops_without_source_hr_or_backup(self, _fetch):
+        database = MagicMock()
+        database.get_app_config.return_value = None
+        database.get_cached_hr.return_value = {
+            "hr_samples": [{"time": 0, "hr": 90}]
+        }
+
+        with pytest.raises(HRBackupError, match="source activity preserved"):
+            hr_for_sync(
+                database,
+                MagicMock(),
+                self.WORKOUT,
+                {"hr_fusion": {"enabled": True}},
+                source_activity_id=123,
+            )
+
+    @patch("hevy2garmin.hr.fetch_activity_hr")
+    def test_hr_for_sync_prefers_denser_backup_over_coarse_download(self, fetch_activity):
+        fetch_activity.return_value = [{"time": 0, "hr": 90}]
+        database = MagicMock()
+        database.get_app_config.return_value = {
+            "workout_start": self.WORKOUT["start_time"],
+            "sample_count": 2,
+            "hr_samples": [
+                {"time": 0, "hr": 100},
+                {"time": 1, "hr": 101},
+            ],
+        }
+
+        result = hr_for_sync(
+            database,
+            MagicMock(),
+            self.WORKOUT,
+            {"hr_fusion": {"enabled": True}},
+            source_activity_id=123,
+        )
+
+        assert result == [
+            {"time": 0.0, "hr": 100},
+            {"time": 1.0, "hr": 101},
+        ]
+
+    @patch("hevy2garmin.hr.fetch_activity_hr")
+    def test_backup_write_failure_is_not_silenced(self, fetch_activity):
+        fetch_activity.return_value = [{"time": 0, "hr": 100}]
+        database = MagicMock()
+        database.get_app_config.return_value = None
+        database.set_app_config.side_effect = RuntimeError("database readonly")
+
+        with pytest.raises(HRBackupError, match="could not back up HR"):
+            backup_activity_hr(
+                database,
+                MagicMock(),
+                self.WORKOUT,
+                source_activity_id=123,
+            )
 
 
 # --- end-to-end: HR actually lands in the FIT -------------------------------

@@ -309,9 +309,11 @@ def sync_one_workout(
     merge_activity_types = set(cfg.get("merge_activity_types", ["strength_training"]))
     merge_watch_strategy = cfg.get("merge_watch_strategy", "replace")
     description_enabled = cfg.get("description_enabled", True)
+    hr_fusion_on = cfg.get("hr_fusion", {}).get("enabled", True)
 
     merge_forced_fresh = False
     merge_delete_id = None
+    protected_source_hr = None
 
     if merge_mode and garmin_client and not dry_run:
         merge_result = attempt_merge(
@@ -351,16 +353,38 @@ def sync_one_workout(
     else:
         merge_fallback = False
 
-    hr_samples = None
-    hr_fusion_on = cfg.get("hr_fusion", {}).get("enabled", True)
-    if not dry_run and hr_fusion_on:
-        from hevy2garmin.hr import hr_for_sync
+    if merge_delete_id is not None and not dry_run:
+        # Deletion is allowed only after the best-known source HR is durable.
+        # This runs even when HR embedding is disabled: disabling fusion should
+        # not discard the only recoverable high-resolution recording.
+        from hevy2garmin.hr import require_activity_hr_backup
 
-        hr_samples = hr_for_sync(merge_store, garmin_client, workout, cfg, _hr_limiter)
+        protected_source_hr = require_activity_hr_backup(
+            merge_store,
+            garmin_client,
+            workout,
+            merge_delete_id,
+            _hr_limiter,
+        )
+
+    hr_samples = None
+    if not dry_run and hr_fusion_on:
+        from hevy2garmin.hr import extract_hevy_hr, hr_for_sync, merge_hr_sources
+
+        if protected_source_hr:
+            hr_samples = merge_hr_sources(
+                extract_hevy_hr(workout), protected_source_hr
+            ) or None
+        else:
+            hr_samples = hr_for_sync(
+                merge_store, garmin_client, workout, cfg, _hr_limiter
+            )
         if not hr_samples:
             # One retry — the watch's daily HR for this window may not
             # have settled on the first try.
-            hr_samples = hr_for_sync(merge_store, garmin_client, workout, cfg, _hr_limiter)
+            hr_samples = hr_for_sync(
+                merge_store, garmin_client, workout, cfg, _hr_limiter
+            )
 
     with tempfile.TemporaryDirectory() as tmp:
         fit_path = str(Path(tmp) / f"{wid}.fit")
@@ -383,8 +407,13 @@ def sync_one_workout(
 
         existing_id = None
         uploaded = False
+        exclude_ids = [merge_delete_id] if merge_delete_id else None
         if start_time and not force_upload and not merge_forced_fresh:
-            existing_id = find_activity_by_start_time(garmin_client, start_time)
+            existing_id = find_activity_by_start_time(
+                garmin_client,
+                start_time,
+                exclude_activity_ids=exclude_ids,
+            )
 
         if existing_id:
             logger.info("  Activity already on Garmin (%s), skipping upload", existing_id)
@@ -415,7 +444,12 @@ def sync_one_workout(
                 raise
             merge_store.update_pending(wid, pre_upload_ids=snapshot_ids, watch_activity_id=str(merge_delete_id) if merge_delete_id else None, phase="processing", attempt_count=1)
             try:
-                upload_result = upload_fit(garmin_client, fit_path, workout_start=start_time)
+                upload_result = upload_fit(
+                    garmin_client,
+                    fit_path,
+                    workout_start=start_time,
+                    exclude_activity_ids=exclude_ids,
+                )
             except GarminUploadRejected as exc:
                 merge_store.update_pending(wid, phase="failed", last_error=str(exc)[:1000])
                 return SyncOneResult(status="failed", merge_fallback=merge_fallback)

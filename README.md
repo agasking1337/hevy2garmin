@@ -380,12 +380,12 @@ This is visible in the activity details on Garmin Connect and any connected apps
 
 ## Enhance Watch Activities (opt-in)
 
-By default, hevy2garmin creates a new Garmin activity from your Hevy workout using your watch's continuous HR monitoring (~2 min sampling). This works without any behavior change.
+By default, hevy2garmin creates a new Garmin activity from your Hevy workout using your watch's daily HR monitoring (~2 min sampling). This works without any behavior change. When a matching watch-recorded workout is found and the **Replace** strategy is selected, hevy2garmin instead downloads that activity's high-resolution HR, saves a durable backup, embeds it in the named Hevy FIT, uploads the replacement, and only then deletes the watch copy. If neither the original FIT nor an existing backup is available, replacement stops and preserves the watch activity.
 
-If you start a **Strength Training** activity on your Garmin watch when you hit the gym, you can enable **Enhance Watch Activities** in the config (`"merge_mode": true`). hevy2garmin will detect the matching watch activity and push your Hevy exercise data directly into it instead of creating a new activity. Benefits:
+If you start a **Strength Training** activity on your Garmin watch when you hit the gym, you can enable **Enhance Watch Activities** in the config (`"merge_mode": true`). hevy2garmin detects the matching watch activity and combines it with your Hevy data using the configured watch strategy. The in-place strategies keep the original watch activity; Replace creates one named composite activity. Depending on the selected strategy, benefits include:
 
 - **1-second HR sampling** (vs ~2 min in continuous monitoring)
-- **Training effect, EPOC, recovery time, and VO2max impact** all count (Garmin ignores these for manually uploaded activities)
+- **Training effect, EPOC, recovery time, and VO2max impact** remain when an in-place strategy keeps the original activity (Garmin does not transfer these to an uploaded replacement)
 - **Correct Strava timestamps** (watch-synced activities use the real time, not upload time)
 - **Single activity** on Garmin (no duplicate)
 
