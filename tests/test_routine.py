@@ -5,7 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from hevy2garmin import sync as sync_module
+from hevy2garmin.sync import routine_schedule_dates
 from hevy2garmin.db_sqlite import SQLiteDatabase
 from hevy2garmin.garmin import create_workout, delete_workout, schedule_workout
 from hevy2garmin.mapper import fit_exercise_strings
@@ -303,3 +306,88 @@ class TestSyncRoutines:
         assert result["created"] == 1
         create_mock.assert_not_called()
         assert store.get_synced_routine("r1") is None
+
+
+class TestRoutineScheduleDates:
+    def test_once_returns_single_date(self) -> None:
+        assert routine_schedule_dates("once", date="2026-07-20") == ["2026-07-20"]
+
+    def test_once_requires_date(self) -> None:
+        with pytest.raises(ValueError):
+            routine_schedule_dates("once")
+
+    def test_once_rejects_bad_date(self) -> None:
+        with pytest.raises(ValueError):
+            routine_schedule_dates("once", date="not-a-date")
+
+    def test_recurring_weekly(self) -> None:
+        # 2026-07-15 is a Wednesday; first Monday on/after is 2026-07-20.
+        dates = routine_schedule_dates("recurring", weekday=0, start_date="2026-07-15", weeks=5)
+        assert dates == ["2026-07-20", "2026-07-27", "2026-08-03", "2026-08-10", "2026-08-17"]
+
+    def test_recurring_start_on_weekday_includes_start(self) -> None:
+        # 2026-07-20 is a Monday → the start date itself is the first occurrence.
+        dates = routine_schedule_dates("recurring", weekday=0, start_date="2026-07-20", weeks=2)
+        assert dates == ["2026-07-20", "2026-07-27"]
+
+    def test_recurring_accepts_string_inputs(self) -> None:
+        dates = routine_schedule_dates("recurring", weekday="2", start_date="2026-07-15", weeks="1")
+        assert dates == ["2026-07-15"]  # 2026-07-15 is a Wednesday (weekday 2)
+
+    def test_recurring_requires_all_fields(self) -> None:
+        with pytest.raises(ValueError):
+            routine_schedule_dates("recurring", weekday=0, weeks=3)
+
+    def test_recurring_rejects_bad_weekday(self) -> None:
+        with pytest.raises(ValueError):
+            routine_schedule_dates("recurring", weekday=9, start_date="2026-07-15", weeks=2)
+
+    def test_recurring_capped(self) -> None:
+        dates = routine_schedule_dates("recurring", weekday=0, start_date="2026-01-05", weeks=999)
+        assert len(dates) == sync_module.MAX_SCHEDULE_OCCURRENCES
+
+    def test_unknown_mode(self) -> None:
+        with pytest.raises(ValueError):
+            routine_schedule_dates("bogus")
+
+
+class TestScheduleRoutine:
+    def _patched(self, tmp_path: Path):
+        store = SQLiteDatabase(tmp_path / "sched.db")
+        schedule_mock = MagicMock()
+        client = MagicMock()
+        patches = [
+            patch.object(sync_module, "load_config", return_value={
+                "garmin_email": "e", "garmin_password": "p"}),
+            patch.object(sync_module.db, "get_db", return_value=store),
+            patch.object(sync_module, "get_client", return_value=client),
+            patch.object(sync_module, "schedule_workout", schedule_mock),
+        ]
+        return store, schedule_mock, patches
+
+    def test_schedules_each_date(self, tmp_path: Path) -> None:
+        store, schedule_mock, patches = self._patched(tmp_path)
+        store.mark_routine_synced("r1", garmin_workout_id="900", title="Push")
+        dates = ["2026-07-20", "2026-07-27"]
+        with patches[0], patches[1], patches[2], patches[3]:
+            result = sync_module.schedule_routine("r1", dates)
+        assert result == {"scheduled": 2, "workout_id": "900", "dates": dates}
+        assert schedule_mock.call_count == 2
+        assert [c.args[1:] for c in schedule_mock.call_args_list] == [
+            ("900", "2026-07-20"), ("900", "2026-07-27")]
+        # Earliest date persisted for display.
+        assert store.get_synced_routine("r1")["scheduled_date"] == "2026-07-20"
+
+    def test_raises_when_not_synced(self, tmp_path: Path) -> None:
+        store, schedule_mock, patches = self._patched(tmp_path)
+        with patches[0], patches[1], patches[2], patches[3]:
+            with pytest.raises(ValueError, match="not synced"):
+                sync_module.schedule_routine("missing", ["2026-07-20"])
+        schedule_mock.assert_not_called()
+
+    def test_raises_on_empty_dates(self, tmp_path: Path) -> None:
+        store, _, patches = self._patched(tmp_path)
+        store.mark_routine_synced("r1", garmin_workout_id="900")
+        with patches[0], patches[1], patches[2], patches[3]:
+            with pytest.raises(ValueError):
+                sync_module.schedule_routine("r1", [])

@@ -6,7 +6,7 @@ import logging
 import os
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date as _date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -836,3 +836,92 @@ def sync_routines(
         stats["created"], stats["updated"], stats["skipped"], stats["failed"], stats["scheduled"],
     )
     return stats
+
+
+# Cap on recurring occurrences, so a typo in "weeks" can't schedule years of entries.
+MAX_SCHEDULE_OCCURRENCES = 52
+
+
+def routine_schedule_dates(
+    mode: str,
+    *,
+    date: str | None = None,
+    weekday: int | str | None = None,
+    start_date: str | None = None,
+    weeks: int | str | None = None,
+) -> list[str]:
+    """Compute the calendar dates to schedule a routine on.
+
+    ``mode="once"`` returns ``[date]``. ``mode="recurring"`` returns one date per
+    week for ``weeks`` weeks, on the given ``weekday`` (0=Monday .. 6=Sunday),
+    starting at the first matching weekday on or after ``start_date``. All inputs
+    are ISO ``YYYY-MM-DD`` strings; raises ``ValueError`` on missing/invalid data.
+    """
+    if mode == "once":
+        if not date:
+            raise ValueError("a date is required for a one-off schedule")
+        return [_date.fromisoformat(date).isoformat()]
+
+    if mode == "recurring":
+        if weekday is None or start_date in (None, "") or weeks in (None, ""):
+            raise ValueError("weekday, start_date and weeks are required for a recurring schedule")
+        weekday = int(weekday)
+        weeks = int(weeks)
+        if not 0 <= weekday <= 6:
+            raise ValueError("weekday must be 0 (Monday) .. 6 (Sunday)")
+        if weeks < 1:
+            raise ValueError("weeks must be at least 1")
+        weeks = min(weeks, MAX_SCHEDULE_OCCURRENCES)
+        start = _date.fromisoformat(start_date)
+        first = start + timedelta(days=(weekday - start.weekday()) % 7)
+        return [(first + timedelta(weeks=i)).isoformat() for i in range(weeks)]
+
+    raise ValueError(f"unknown schedule mode: {mode!r}")
+
+
+def schedule_routine(
+    hevy_routine_id: str,
+    dates: list[str],
+    *,
+    config: dict[str, Any] | None = None,
+    **overrides: Any,
+) -> dict:
+    """Schedule an already-synced routine's Garmin workout on the given dates.
+
+    Looks up the routine's ``garmin_workout_id`` (it must have been synced first),
+    then calls the Garmin schedule endpoint once per date. Persists the earliest
+    date on the routine record for display. Returns
+    ``{"scheduled": n, "workout_id": id, "dates": [...]}``.
+    """
+    if not dates:
+        raise ValueError("no dates to schedule")
+
+    cfg = config or load_config()
+    candidate_store = db.get_db() if callable(getattr(db, "get_db", None)) else None
+    store = candidate_store if isinstance(candidate_store, Database) else db
+
+    record = store.get_synced_routine(hevy_routine_id)
+    if not record or not record.get("garmin_workout_id"):
+        raise ValueError("Routine is not synced yet — sync it before scheduling.")
+    workout_id = record["garmin_workout_id"]
+
+    garmin_email = overrides.get("garmin_email") or cfg.get("garmin_email")
+    garmin_password = overrides.get("garmin_password") or cfg.get("garmin_password", "")
+    garmin_token_dir = cfg.get("garmin_token_dir", "~/.garminconnect")
+
+    logger.info("Authenticating with Garmin Connect...")
+    client = get_client(garmin_email, garmin_password, garmin_token_dir)
+
+    for day in dates:
+        schedule_workout(client, workout_id, day)
+
+    store.mark_routine_synced(
+        hevy_routine_id,
+        garmin_workout_id=workout_id,
+        title=record.get("title", ""),
+        hevy_updated_at=record.get("hevy_updated_at"),
+        scheduled_date=min(dates),
+        content_hash=record.get("content_hash"),
+    )
+    logger.info("Scheduled routine %s on %d date(s)", hevy_routine_id, len(dates))
+    return {"scheduled": len(dates), "workout_id": workout_id, "dates": dates}

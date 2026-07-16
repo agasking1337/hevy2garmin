@@ -22,7 +22,7 @@ from hevy2garmin.auth import auth_enabled, verify_session, sign_session, check_p
 from hevy2garmin.config import is_configured, load_config, save_config
 from hevy2garmin.demo import is_demo_mode
 from hevy2garmin.ratelimit import record_rate_limit, cooldown_remaining, clear_rate_limit, format_cooldown
-from hevy2garmin.sync import sync, sync_routines
+from hevy2garmin.sync import sync, sync_routines, routine_schedule_dates, schedule_routine
 
 logger = logging.getLogger("hevy2garmin")
 
@@ -1306,10 +1306,13 @@ async def routines_page(request: Request):
         _db = db.get_db()
         hevy = HevyClient(api_key=config.get("hevy_api_key"))
         for r in fetch_all_routines(hevy):
+            record = _db.get_synced_routine(r.get("id", ""))
             routines.append({
+                "id": r.get("id", ""),
                 "title": r.get("title") or r.get("name") or "Routine",
                 "exercise_count": len(r.get("exercises", [])),
-                "synced": _db.get_synced_routine(r.get("id", "")) is not None,
+                "synced": record is not None,
+                "scheduled_date": (record or {}).get("scheduled_date"),
             })
     except Exception as e:
         fetch_error = str(e)
@@ -1343,6 +1346,44 @@ async def api_routines_sync(request: Request):
     )
     cls = "toast-error" if result["failed"] else "toast-success"
     return HTMLResponse(f'<div class="toast {cls}">Routine sync complete: {msg}</div>')
+
+
+@app.post("/api/routines/{hevy_routine_id}/schedule", response_class=HTMLResponse)
+async def api_routine_schedule(request: Request, hevy_routine_id: str):
+    """Schedule one synced routine on the Garmin calendar (once or recurring weekly)."""
+    if is_demo_mode():
+        return HTMLResponse('<div class="toast toast-success">Scheduling disabled in demo mode.</div>')
+
+    form = await request.form()
+    mode = form.get("mode", "once")
+    try:
+        dates = routine_schedule_dates(
+            mode,
+            date=form.get("date"),
+            weekday=form.get("weekday"),
+            start_date=form.get("start_date"),
+            weeks=form.get("weeks"),
+        )
+    except (ValueError, TypeError) as e:
+        return HTMLResponse(f'<div class="toast toast-error">Invalid schedule: {e}</div>')
+
+    if not _acquire_sync_lock():
+        return HTMLResponse('<div class="toast toast-error">Another sync is already running. Please wait.</div>')
+
+    try:
+        result = schedule_routine(hevy_routine_id, dates)
+    except ValueError as e:
+        return HTMLResponse(f'<div class="toast toast-error">{e}</div>')
+    except Exception as e:
+        return HTMLResponse(f'<div class="toast toast-error">Scheduling failed: {e}</div>')
+    finally:
+        _sync_executing.release()
+
+    n = result["scheduled"]
+    span = f" ({result['dates'][0]} → {result['dates'][-1]})" if n > 1 else f" on {result['dates'][0]}"
+    return HTMLResponse(
+        f'<div class="toast toast-success">Scheduled {n} session(s){span}.</div>'
+    )
 
 
 @app.post("/api/sync/{workout_id}", response_class=HTMLResponse)
