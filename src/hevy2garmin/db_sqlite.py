@@ -123,6 +123,35 @@ class SQLiteDatabase(Database):
             )
         """)
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                email TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now')),
+                last_login_at TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                token_hash TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                created_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_secrets (
+                user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                ciphertext TEXT NOT NULL,
+                key_version INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (user_id, name),
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS synced_routines (
                 hevy_routine_id TEXT PRIMARY KEY,
                 garmin_workout_id TEXT,

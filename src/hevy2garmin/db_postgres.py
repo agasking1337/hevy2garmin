@@ -127,6 +127,33 @@ class PostgresDatabase(Database):
                     )
                 """)
                 cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        id UUID PRIMARY KEY,
+                        email TEXT NOT NULL UNIQUE,
+                        password_hash TEXT NOT NULL,
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        last_login_at TIMESTAMPTZ
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS user_sessions (
+                        token_hash TEXT PRIMARY KEY,
+                        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        expires_at TIMESTAMPTZ NOT NULL,
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS user_secrets (
+                        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        name TEXT NOT NULL,
+                        ciphertext TEXT NOT NULL,
+                        key_version INTEGER NOT NULL DEFAULT 1,
+                        updated_at TIMESTAMPTZ DEFAULT NOW(),
+                        PRIMARY KEY (user_id, name)
+                    )
+                """)
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS synced_routines (
                         hevy_routine_id TEXT PRIMARY KEY,
                         garmin_workout_id TEXT,
