@@ -335,6 +335,14 @@ async def check_setup(request: Request, call_next):
     if path == "/favicon.ico" or path.startswith("/static"):
         return await call_next(request)
 
+    if not auth_enabled():
+        if path == "/login":
+            return await call_next(request)
+        if path.startswith("/api/"):
+            from starlette.responses import Response
+            return Response("Authentication is not configured", status_code=503)
+        return RedirectResponse("/login")
+
     # ── Dashboard auth gate ──────────────────────────────────────────────
     # When H2G_PASSWORD is set, all routes except /login and /api/cron/*
     # require a valid session cookie. Without it, redirect to /login.
@@ -380,7 +388,14 @@ async def check_setup(request: Request, call_next):
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
     """Show login form. Redirects to dashboard if already authenticated or auth disabled."""
-    if not auth_enabled() or verify_session(request.cookies.get(SESSION_COOKIE)):
+    if not auth_enabled():
+        return HTMLResponse(
+            _jinja_env.get_template("login.html").render(
+                error="Dashboard login is not configured. Set H2G_PASSWORD and restart the app."
+            ),
+            status_code=503,
+        )
+    if verify_session(request.cookies.get(SESSION_COOKIE)):
         return RedirectResponse("/")
     error = request.query_params.get("error")
     return HTMLResponse(_jinja_env.get_template("login.html").render(error=error))
@@ -389,6 +404,13 @@ async def login_page(request: Request):
 @app.post("/login")
 async def login_submit(request: Request, password: str = Form(...)):
     """Verify password, set session cookie, redirect to dashboard."""
+    if not auth_enabled():
+        return HTMLResponse(
+            _jinja_env.get_template("login.html").render(
+                error="Dashboard login is not configured. Set H2G_PASSWORD and restart the app."
+            ),
+            status_code=503,
+        )
     next_url = request.query_params.get("next", "/")
     # Prevent open redirect: only allow relative paths
     if not next_url.startswith("/") or next_url.startswith("//"):

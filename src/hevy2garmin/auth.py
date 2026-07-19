@@ -1,21 +1,39 @@
-"""Simple shared-password auth for the hevy2garmin dashboard.
+"""Shared-password auth for the hevy2garmin dashboard.
 
-When H2G_PASSWORD is set, all page/API routes require a valid session cookie.
-When unset, auth is disabled (backward-compatible with existing deployments).
+All dashboard routes require a valid session. ``H2G_PASSWORD`` is read from the
+process environment or, for local development, the repository's ``.env`` file.
+If it is absent, the app fails closed and exposes only the login error page.
 """
 
 import hashlib
 import hmac
 import os
 import time
+from pathlib import Path
 
 SESSION_COOKIE = "h2g_session"
 SESSION_TTL = 30 * 24 * 3600  # 30 days
 
 
+def _password_from_dotenv() -> str | None:
+    """Read ``H2G_PASSWORD`` from a local .env file without a dependency."""
+    candidates = (Path.cwd() / ".env", Path(__file__).resolve().parents[3] / ".env")
+    for env_file in candidates:
+        try:
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                key, separator, value = line.partition("=")
+                if separator and key.strip() == "H2G_PASSWORD":
+                    return value.strip().strip('"').strip("'") or None
+        except OSError:
+            continue
+    return None
+
+
 def get_password() -> str | None:
-    """Return the shared password, or None if auth is disabled."""
-    return os.environ.get("H2G_PASSWORD") or None
+    """Return the configured shared password, if one exists."""
+    if "H2G_PASSWORD" in os.environ:
+        return os.environ["H2G_PASSWORD"] or None
+    return _password_from_dotenv()
 
 
 def auth_enabled() -> bool:
@@ -41,7 +59,7 @@ def sign_session() -> str:
 def verify_session(cookie: str | None) -> bool:
     """Verify a session cookie is valid and not expired."""
     if not cookie or not auth_enabled():
-        return not auth_enabled()
+        return False
     try:
         parts = cookie.split(".")
         if len(parts) != 3 or parts[0] != "v1":

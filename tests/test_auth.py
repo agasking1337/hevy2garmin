@@ -13,7 +13,7 @@ from hevy2garmin.auth import sign_session, verify_session, check_password, auth_
 @pytest.fixture
 def client_no_secret():
     """TestClient with no HEVY2GARMIN_SECRET (local dev mode)."""
-    with patch.dict(os.environ, {}, clear=False):
+    with patch.dict(os.environ, {"H2G_PASSWORD": "test-dashboard-pw"}, clear=False):
         os.environ.pop("HEVY2GARMIN_SECRET", None)
         from hevy2garmin.server import app
         yield TestClient(app)
@@ -22,7 +22,7 @@ def client_no_secret():
 @pytest.fixture
 def client_with_secret():
     """TestClient with HEVY2GARMIN_SECRET set (cloud mode)."""
-    with patch.dict(os.environ, {"HEVY2GARMIN_SECRET": "test-secret-123"}):
+    with patch.dict(os.environ, {"HEVY2GARMIN_SECRET": "test-secret-123", "H2G_PASSWORD": "test-dashboard-pw"}):
         from hevy2garmin.server import app
         yield TestClient(app)
 
@@ -32,7 +32,7 @@ class TestAuthMiddleware:
         """Without HEVY2GARMIN_SECRET, POST /api/* is allowed (local dev)."""
         resp = client_no_secret.post("/api/unsync-all", data={"confirm": "RESET"})
         # Should not be 401 — might be 200 or other error, but not auth failure
-        assert resp.status_code != 401
+        assert resp.status_code == 401
 
     def test_secret_blocks_post_without_cookie(self, client_with_secret) -> None:
         """With HEVY2GARMIN_SECRET, POST /api/* without cookie returns 401."""
@@ -44,7 +44,7 @@ class TestAuthMiddleware:
         resp = client_with_secret.post(
             "/api/unsync-all",
             data={"confirm": "RESET"},
-            cookies={"h2g_auth": "test-secret-123"},
+            cookies={"h2g_auth": "test-secret-123", "h2g_session": sign_session()},
         )
         assert resp.status_code != 401
 
@@ -54,6 +54,7 @@ class TestAuthMiddleware:
             "/api/unsync-all",
             data={"confirm": "RESET"},
             headers={"x-api-key": "test-secret-123"},
+            cookies={"h2g_session": sign_session()},
         )
         assert resp.status_code != 401
 
@@ -62,13 +63,13 @@ class TestAuthMiddleware:
         resp = client_with_secret.post(
             "/api/unsync-all",
             data={"confirm": "RESET"},
-            cookies={"h2g_auth": "wrong-secret"},
+            cookies={"h2g_auth": "wrong-secret", "h2g_session": sign_session()},
         )
         assert resp.status_code == 401
 
     def test_get_pages_set_cookie(self, client_with_secret) -> None:
         """GET pages auto-set the auth cookie when HEVY2GARMIN_SECRET is configured."""
-        resp = client_with_secret.get("/setup")
+        resp = client_with_secret.get("/setup", cookies={"h2g_session": sign_session()})
         cookies = resp.cookies
         assert "h2g_auth" in cookies
         assert cookies["h2g_auth"] == "test-secret-123"
@@ -91,7 +92,8 @@ class TestPasswordAuthHelpers:
     def test_auth_disabled_by_default(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("H2G_PASSWORD", None)
-            assert not auth_enabled()
+            with patch("hevy2garmin.auth._password_from_dotenv", return_value=None):
+                assert not auth_enabled()
 
     def test_auth_enabled_when_set(self) -> None:
         with patch.dict(os.environ, {"H2G_PASSWORD": "secret123"}):
@@ -125,7 +127,8 @@ class TestPasswordAuthHelpers:
     def test_verify_true_when_disabled(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("H2G_PASSWORD", None)
-            assert verify_session(None) is True
+            with patch("hevy2garmin.auth._password_from_dotenv", return_value=None):
+                assert verify_session(None) is False
 
 
 class TestPasswordAuthRoutes:
@@ -171,3 +174,13 @@ class TestPasswordAuthRoutes:
         resp = client_with_password.get("/api/sync-one")
         # API routes should get 401, not a redirect
         assert resp.status_code == 401
+
+    def test_missing_password_fails_closed(self) -> None:
+        """No dashboard or API content is exposed before login is configured."""
+        with patch.dict(os.environ, {"H2G_PASSWORD": ""}, clear=False):
+            from hevy2garmin.server import app
+            client = TestClient(app, follow_redirects=False)
+
+            assert client.get("/").headers["location"] == "/login"
+            assert client.get("/api/sync-one").status_code == 503
+            assert client.get("/login").status_code == 503
